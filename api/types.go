@@ -33,6 +33,22 @@ func (e StatusError) Error() string {
 	}
 }
 
+// /api/chat
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type ChatRequest struct {
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+}
+
+type ChatResponse struct {
+	CreatedAt time.Time `json:"created_at"`
+	Message   Message   `json:"message"`
+}
+
 // ImageData represents the raw binary data of an image file.
 type ImageData []byte
 

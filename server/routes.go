@@ -264,91 +264,24 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			return
 		}
 
-		prompt = b.String()
-	}
-
-	slog.Debug("generate request", "images", len(images), "prompt", prompt)
-
-	ch := make(chan any)
-	go func() {
-		// TODO (jmorganca): avoid building the response twice both here and below
-		var sb strings.Builder
-		defer close(ch)
-		if err := r.Completion(c.Request.Context(), llm.CompletionRequest{
-			Prompt:  prompt,
-			Images:  images,
-			Format:  req.Format,
-			Options: opts,
-		}, func(cr llm.CompletionResponse) {
-			res := api.GenerateResponse{
-				Model:      req.Model,
-				CreatedAt:  time.Now().UTC(),
-				Response:   cr.Content,
-				Done:       cr.Done,
-				DoneReason: cr.DoneReason,
-				Metrics: api.Metrics{
-					PromptEvalCount:    cr.PromptEvalCount,
-					PromptEvalDuration: cr.PromptEvalDuration,
-					EvalCount:          cr.EvalCount,
-					EvalDuration:       cr.EvalDuration,
-				},
-			}
-
-			if _, err := sb.WriteString(cr.Content); err != nil {
-				ch <- gin.H{"error": err.Error()}
-			}
-
-			if cr.Done {
-				res.TotalDuration = time.Since(checkpointStart)
-				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
-
-				if !req.Raw {
-					tokens, err := r.Tokenize(c.Request.Context(), prompt+sb.String())
-					if err != nil {
-						ch <- gin.H{"error": err.Error()}
-						return
-					}
-					res.Context = tokens
-				}
-			}
-
-			ch <- res
-		}); err != nil {
-			ch <- gin.H{"error": err.Error()}
-		}
-	}()
-
-	if req.Stream != nil && !*req.Stream {
-		var r api.GenerateResponse
-		var sb strings.Builder
-		for rr := range ch {
-			switch t := rr.(type) {
-			case api.GenerateResponse:
-				sb.WriteString(t.Response)
-				r = t
-			case gin.H:
-				msg, ok := t["error"].(string)
-				if !ok {
-					msg = "unexpected error format in response"
-				}
-
-				c.JSON(http.StatusInternalServerError, gin.H{"error": msg})
-				return
-			default:
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "unexpected response"})
+			if loaded.llm == nil {
 				return
 			}
-		}
 
-		r.Response = sb.String()
-		c.JSON(http.StatusOK, r)
-		return
+			loaded.llm.Close()
+			loaded.llm = nil
+			loaded.digest = ""
+		})
 	}
 
-	streamResponse(c, ch)
+	loaded.expireTimer.Reset(sessionDuration)
+	return nil
 }
 
-func (s *Server) EmbedHandler(c *gin.Context) {
+func GenerateHandler(c *gin.Context) {
+	loaded.mu.Lock()
+	defer loaded.mu.Unlock()
+
 	checkpointStart := time.Now()
 	var req api.EmbedRequest
 	err := c.ShouldBindJSON(&req)
@@ -1145,26 +1078,14 @@ func (s *Server) GenerateRoutes() http.Handler {
 		allowedHostsMiddleware(s.addr),
 	)
 
-	r.POST("/api/pull", s.PullHandler)
-	r.POST("/api/generate", s.GenerateHandler)
-	r.POST("/api/chat", s.ChatHandler)
-	r.POST("/api/embed", s.EmbedHandler)
-	r.POST("/api/embeddings", s.EmbeddingsHandler)
-	r.POST("/api/create", s.CreateHandler)
-	r.POST("/api/push", s.PushHandler)
-	r.POST("/api/copy", s.CopyHandler)
-	r.DELETE("/api/delete", s.DeleteHandler)
-	r.POST("/api/show", s.ShowHandler)
-	r.POST("/api/blobs/:digest", s.CreateBlobHandler)
-	r.HEAD("/api/blobs/:digest", s.HeadBlobHandler)
-	r.GET("/api/ps", s.PsHandler)
-
-	// Compatibility endpoints
-	r.POST("/v1/chat/completions", openai.ChatMiddleware(), s.ChatHandler)
-	r.POST("/v1/completions", openai.CompletionsMiddleware(), s.GenerateHandler)
-	r.POST("/v1/embeddings", openai.EmbeddingsMiddleware(), s.EmbedHandler)
-	r.GET("/v1/models", openai.ListMiddleware(), s.ListHandler)
-	r.GET("/v1/models/:model", openai.RetrieveMiddleware(), s.ShowHandler)
+	r.POST("/api/pull", PullModelHandler)
+	r.POST("/api/generate", GenerateHandler)
+	r.POST("/api/embeddings", EmbeddingHandler)
+	r.POST("/api/create", CreateModelHandler)
+	r.POST("/api/push", PushModelHandler)
+	r.POST("/api/copy", CopyModelHandler)
+	r.DELETE("/api/delete", DeleteModelHandler)
+	r.POST("/api/show", ShowModelHandler)
 
 	for _, method := range []string{http.MethodGet, http.MethodHead} {
 		r.Handle(method, "/", func(c *gin.Context) {

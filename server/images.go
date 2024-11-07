@@ -60,136 +60,76 @@ type registryOptions struct {
 }
 
 type Model struct {
-	Name           string `json:"name"`
-	Config         ConfigV2
-	ShortName      string
-	ModelPath      string
-	ParentModel    string
-	AdapterPaths   []string
-	ProjectorPaths []string
-	System         string
-	License        []string
-	Digest         string
-	Options        map[string]interface{}
-	Messages       []api.Message
-
-	Template *template.Template
+	Name          string `json:"name"`
+	ShortName     string
+	ModelPath     string
+	OriginalModel string
+	AdapterPaths  []string
+	Template      string
+	System        string
+	License       []string
+	Digest        string
+	ConfigDigest  string
+	Options       map[string]interface{}
+	Embeddings    []vector.Embedding
 }
 
-// CheckCapabilities checks if the model has the specified capabilities returning an error describing
-// any missing or unknown capabilities
-func (m *Model) CheckCapabilities(caps ...Capability) error {
-	var errs []error
-	for _, cap := range caps {
-		switch cap {
-		case CapabilityCompletion:
-			f, err := os.Open(m.ModelPath)
-			if err != nil {
-				slog.Error("couldn't open model file", "error", err)
-				continue
-			}
-			defer f.Close()
-
-			// TODO(mxyng): decode the GGML into model to avoid doing this multiple times
-			ggml, _, err := llm.DecodeGGML(f, 0)
-			if err != nil {
-				slog.Error("couldn't decode ggml", "error", err)
-				continue
-			}
-
-			if _, ok := ggml.KV()[fmt.Sprintf("%s.pooling_type", ggml.KV().Architecture())]; ok {
-				errs = append(errs, errCapabilityCompletion)
-			}
-		case CapabilityTools:
-			if !slices.Contains(m.Template.Vars(), "tools") {
-				errs = append(errs, errCapabilityTools)
-			}
-		case CapabilityInsert:
-			vars := m.Template.Vars()
-			if !slices.Contains(vars, "suffix") {
-				errs = append(errs, errCapabilityInsert)
-			}
-		default:
-			slog.Error("unknown capability", "capability", cap)
-			return fmt.Errorf("unknown capability: %s", cap)
-		}
+func (m *Model) Prompt(request api.GenerateRequest, embedding string) (string, error) {
+	t := m.Template
+	if request.Template != "" {
+		t = request.Template
 	}
 
-	if err := errors.Join(errs...); err != nil {
-		return fmt.Errorf("%w %w", errCapabilities, errors.Join(errs...))
+	tmpl, err := template.New("").Parse(t)
+	if err != nil {
+		return "", err
 	}
 
-	return nil
+	var vars struct {
+		First  bool
+		System string
+		Prompt string
+		Embed  string
+
+		// deprecated: versions <= 0.0.7 used this to omit the system prompt
+		Context []int
+	}
+
+	vars.First = len(request.Context) == 0
+	vars.System = m.System
+	vars.Prompt = request.Prompt
+	vars.Context = request.Context
+	vars.Embed = embedding
+
+	if request.System != "" {
+		vars.System = request.System
+	}
+
+	var sb strings.Builder
+	if err := tmpl.Execute(&sb, vars); err != nil {
+		return "", err
+	}
+
+	return sb.String(), nil
 }
 
-func (m *Model) String() string {
-	var modelfile parser.File
+type ManifestV2 struct {
+	SchemaVersion int      `json:"schemaVersion"`
+	MediaType     string   `json:"mediaType"`
+	Config        Layer    `json:"config"`
+	Layers        []*Layer `json:"layers"`
+}
 
-	modelfile.Commands = append(modelfile.Commands, parser.Command{
-		Name: "model",
-		Args: m.ModelPath,
-	})
+type Layer struct {
+	MediaType string `json:"mediaType"`
+	Digest    string `json:"digest"`
+	Size      int64  `json:"size"`
+	From      string `json:"from,omitempty"`
+}
 
-	for _, adapter := range m.AdapterPaths {
-		modelfile.Commands = append(modelfile.Commands, parser.Command{
-			Name: "adapter",
-			Args: adapter,
-		})
-	}
-
-	for _, projector := range m.ProjectorPaths {
-		modelfile.Commands = append(modelfile.Commands, parser.Command{
-			Name: "model",
-			Args: projector,
-		})
-	}
-
-	if m.Template != nil {
-		modelfile.Commands = append(modelfile.Commands, parser.Command{
-			Name: "template",
-			Args: m.Template.String(),
-		})
-	}
-
-	if m.System != "" {
-		modelfile.Commands = append(modelfile.Commands, parser.Command{
-			Name: "system",
-			Args: m.System,
-		})
-	}
-
-	for k, v := range m.Options {
-		switch v := v.(type) {
-		case []any:
-			for _, s := range v {
-				modelfile.Commands = append(modelfile.Commands, parser.Command{
-					Name: k,
-					Args: fmt.Sprintf("%v", s),
-				})
-			}
-		default:
-			modelfile.Commands = append(modelfile.Commands, parser.Command{
-				Name: k,
-				Args: fmt.Sprintf("%v", v),
-			})
-		}
-	}
-
-	for _, license := range m.License {
-		modelfile.Commands = append(modelfile.Commands, parser.Command{
-			Name: "license",
-			Args: license,
-		})
-	}
-
-	for _, msg := range m.Messages {
-		modelfile.Commands = append(modelfile.Commands, parser.Command{
-			Name: "message",
-			Args: fmt.Sprintf("%s: %s", msg.Role, msg.Content),
-		})
-	}
-
-	return modelfile.String()
+type LayerReader struct {
+	Layer
+	io.Reader
 }
 
 type ConfigV2 struct {
